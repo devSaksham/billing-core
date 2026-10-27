@@ -1,0 +1,287 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>billing-core | idempotent billing API</title>
+<meta name="description" content="A small invoice API that stays correct when clients retry. FastAPI, SQLite, 40 tests, written decision log.">
+<style>
+  :root {
+    --bg: #f7f6f2; --card: #ffffff; --ink: #1c1f23; --muted: #5d646d;
+    --line: #e2e0d8; --accent: #0b6e66; --accent-ink: #ffffff;
+    --ok: #0b6e66; --warn: #9a5b00; --bad: #b3261e; --code: #f0eee7;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #14171a; --card: #1b1f23; --ink: #e9e8e3; --muted: #9aa1a9;
+      --line: #2b3036; --accent: #3fb8ac; --accent-ink: #0c1412;
+      --ok: #3fb8ac; --warn: #e0a23b; --bad: #f2877f; --code: #23282d;
+    }
+  }
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 16px/1.6 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  .wrap { max-width: 760px; margin: 0 auto; padding: 0 16px 64px; }
+  header { padding: 40px 0 8px; }
+  .tag { font: 13px ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--accent); letter-spacing: .02em; }
+  h1 { font-size: clamp(1.9rem, 6vw, 2.6rem); line-height: 1.15; margin: 8px 0 12px; }
+  h2 { font-size: 1.3rem; margin: 40px 0 10px; }
+  p { margin: 0 0 12px; }
+  .lead { font-size: 1.1rem; color: var(--muted); }
+  a { color: var(--accent); }
+  .btns { display: flex; flex-wrap: wrap; gap: 10px; margin: 18px 0 0; }
+  .btn {
+    display: inline-block; padding: 10px 16px; border-radius: 8px; text-decoration: none;
+    border: 1px solid var(--line); color: var(--ink); background: var(--card); font-weight: 600; font-size: 15px;
+  }
+  .btn.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+  .stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin: 24px 0 0; }
+  .stat { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 12px; }
+  .stat b { display: block; font-size: 1.5rem; line-height: 1.1; }
+  .stat span { font-size: 13px; color: var(--muted); }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 16px; }
+  code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13.5px; }
+  code { background: var(--code); padding: 1px 5px; border-radius: 4px; }
+  pre { background: var(--code); padding: 12px; border-radius: 8px; overflow-x: auto; margin: 10px 0 0; }
+  .note { font-size: 13.5px; color: var(--muted); margin-top: 10px; }
+
+  .demo-top { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+  .balance { font-size: 1.8rem; font-weight: 700; }
+  .balance small { font-size: 13px; font-weight: 400; color: var(--muted); }
+  .controls { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin: 14px 0; }
+  .controls button, .reset {
+    padding: 10px 8px; border-radius: 8px; border: 1px solid var(--line);
+    background: var(--bg); color: var(--ink); font: inherit; font-size: 14px; cursor: pointer; text-align: left;
+  }
+  .controls button:active, .reset:active { transform: translateY(1px); }
+  .controls button strong { display: block; font-size: 14px; }
+  .controls button span { font-size: 12.5px; color: var(--muted); }
+  .reset { text-align: center; width: 100%; }
+  .log { margin-top: 12px; max-height: 280px; overflow-y: auto; border-top: 1px solid var(--line); }
+  .row { padding: 8px 0; border-bottom: 1px solid var(--line); font-size: 13.5px; }
+  .row .req { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .badge { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px; font-weight: 700; margin-right: 6px; }
+  .s201 { background: color-mix(in srgb, var(--ok) 18%, transparent); color: var(--ok); }
+  .s409, .s422 { background: color-mix(in srgb, var(--warn) 20%, transparent); color: var(--warn); }
+  .replay { color: var(--accent); font-weight: 600; }
+  .next { color: var(--muted); display: block; margin-top: 2px; }
+  .empty { padding: 14px 0; color: var(--muted); font-size: 14px; }
+
+  ol.decisions { padding-left: 20px; margin: 0; }
+  ol.decisions li { margin-bottom: 10px; }
+  table { width: 100%; border-collapse: collapse; font-size: 14.5px; }
+  th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; font-size: 13px; }
+  footer { margin-top: 48px; padding-top: 20px; border-top: 1px solid var(--line); color: var(--muted); font-size: 14px; }
+  footer a { margin-right: 14px; }
+  @media (max-width: 420px) { .stats { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <div class="tag">billing-core</div>
+  <h1>A billing API that stays correct when clients retry.</h1>
+  <p class="lead">A client times out and resends. A worker dies halfway. Someone gets charged twice. This is a small, tested answer to that problem: invoices, payments, credits and proration, with idempotency on every call that moves money.</p>
+  <div class="btns">
+    <a class="btn primary" href="https://github.com/devSaksham/billing-core">View the code</a>
+    <a class="btn" href="https://github.com/devSaksham/billing-core/blob/main/DECISIONS.md">Read the decision log</a>
+  </div>
+  <div class="stats">
+    <div class="stat"><b>40</b><span>tests passing</span></div>
+    <div class="stat"><b>20</b><span>racing threads, balance changes once</span></div>
+    <div class="stat"><b>0</b><span>floats used for money</span></div>
+  </div>
+</header>
+
+<h2>Try the retry problem</h2>
+<div class="card" id="demo">
+  <div class="demo-top">
+    <div class="balance" id="balance">100.00 <small>INR owed</small></div>
+    <div class="note" style="margin:0">Invoice total 100.00. Money is stored as integer paise.</div>
+  </div>
+  <div class="controls">
+    <button data-act="same"><strong>Pay 25.00, key pay-1</strong><span>Press it several times. Balance drops once.</span></button>
+    <button data-act="new"><strong>Pay 25.00, new key</strong><span>A genuinely new payment. Balance drops again.</span></button>
+    <button data-act="diff"><strong>Pay 99.00, key pay-1</strong><span>Same key, different body. Rejected.</span></button>
+    <button data-act="burst"><strong>Send 20 at once, one key</strong><span>One applied, nineteen replayed.</span></button>
+    <button data-act="over"><strong>Pay 500.00, new key</strong><span>More than is owed. Rejected, nothing written.</span></button>
+    <button data-act="full"><strong>Pay the full balance, key pay-final</strong><span>Then press it again: you get the original success, not an error.</span></button>
+  </div>
+  <button class="reset" id="reset">Reset invoice</button>
+  <div class="log" id="log"><div class="empty">Responses appear here, newest first.</div></div>
+  <p class="note">This runs in your browser. It is a JavaScript model of the same rules as the Python API, not the live server. The requests here run one after another. The real concurrent test, with 20 threads on one database file, is <a href="https://github.com/devSaksham/billing-core/blob/main/tests/test_concurrency.py">tests/test_concurrency.py</a>.</p>
+</div>
+
+<h2>How it works</h2>
+<div class="card">
+  <p>The idempotency check, the money movement and the stored response all live in one database transaction.</p>
+<pre>BEGIN IMMEDIATE            -- take the write lock first
+SELECT ... WHERE scope = ? AND key = ?
+  found, same body  -> replay stored response
+  found, new body   -> 422 idempotency_key_reused
+  not found         -> do the work, store the response
+COMMIT</pre>
+  <p style="margin-top:12px">SQLite lets one writer through at a time, so two requests with the same key cannot both miss the lookup. The second waits, then replays.</p>
+</div>
+
+<h2>Decisions worth a look</h2>
+<div class="card">
+  <ol class="decisions">
+    <li><b>Integer minor units.</b> Proration uses <code>(2n + d) // (2d)</code>, which is round half up with no float involved.</li>
+    <li><b>Append-only ledger.</b> The balance is derived on read, so it cannot drift from the history.</li>
+    <li><b>Replay before business rules.</b> A retry arriving after the invoice was settled gets the original <code>201</code>, not a confusing <code>409</code>.</li>
+    <li><b>Same key, different body is an error.</b> It is almost always a client bug, so it is not silently replayed.</li>
+    <li><b>Errors say what to do next.</b> Every error has <code>code</code>, <code>message</code>, <code>retryable</code> and <code>next_step</code>.</li>
+    <li><b>Lock timeouts are retryable.</b> A busy database returns <code>503</code> with an instruction to resend the same key.</li>
+  </ol>
+  <p class="note">I checked the concurrency test is not vacuous: with the key lookup disabled, it fails.</p>
+</div>
+
+<h2>Limits</h2>
+<div class="card">
+  <table>
+    <tr><th>Not built</th><th>What a real system would do</th></tr>
+    <tr><td>Single writer (SQLite)</td><td>Postgres with a unique constraint on <code>(scope, key)</code> and row locks</td></tr>
+    <tr><td>Keys never expire</td><td>Expire after a window such as 24 hours</td></tr>
+    <tr><td>No payment gateway</td><td>An "in progress" key state, since a gateway call cannot sit inside a transaction</td></tr>
+    <tr><td>No auth, refunds or tax</td><td>Auth, a refund flow, an invoice state machine</td></tr>
+  </table>
+  <p class="note">This is a learning project, not production code.</p>
+</div>
+
+<h2>Run it</h2>
+<div class="card">
+<pre>git clone https://github.com/devSaksham/billing-core
+cd billing-core
+pip install -r requirements.txt
+python -m pytest -q        # 40 passed
+uvicorn billing.api:create_app --factory</pre>
+</div>
+
+<footer>
+  <p><b>Saksham Agrawal</b>. Final-year B.Tech (AI/ML), UPES Dehradun, 2027.</p>
+  <p>
+    <a href="https://github.com/devSaksham">GitHub</a>
+    <a href="https://www.linkedin.com/in/sakshamhere">LinkedIn</a>
+    <a href="https://leetcode.com/u/Sakshamm_codes/">LeetCode (530+ solved)</a>
+  </p>
+</footer>
+
+</div>
+
+<script>
+(function () {
+  var TOTAL = 10000;
+  var state;
+  function fresh() { state = { ledger: [], keys: {} }; }
+  fresh();
+
+  function paid() { return state.ledger.reduce(function (s, e) { return s + e.amount; }, 0); }
+  function balance() { return TOTAL - paid(); }
+  function money(n) { return (n / 100).toFixed(2); }
+
+  // Same rules as billing/service.py: replay check first, then business rules.
+  function pay(key, amount) {
+    var stored = state.keys[key];
+    if (stored) {
+      if (stored.amount !== amount) {
+        return { status: 422, code: "idempotency_key_reused",
+                 next: "Use a new Idempotency-Key, or resend the original body to get the original result." };
+      }
+      return { status: 201, replayed: true, balance: stored.balanceAfter };
+    }
+    var bal = balance();
+    if (bal === 0) {
+      return { status: 409, code: "invoice_settled", next: "Nothing to do. The invoice has no balance left." };
+    }
+    if (amount > bal) {
+      return { status: 409, code: "amount_exceeds_balance",
+               next: "Resend with amount_minor of " + bal + " or less." };
+    }
+    state.ledger.push({ key: key, amount: amount });
+    var after = balance();
+    state.keys[key] = { amount: amount, balanceAfter: after };
+    return { status: 201, replayed: false, balance: after };
+  }
+
+  var seq = 0;
+  function newKey() { seq += 1; return "pay-" + (seq + 1); }
+
+  var logEl = document.getElementById("log");
+  var balEl = document.getElementById("balance");
+
+  function render() {
+    var b = balance();
+    balEl.innerHTML = money(b) + ' <small>INR owed' + (b === 0 ? ", paid in full" : "") + "</small>";
+  }
+
+  function addRow(label, res) {
+    var empty = logEl.querySelector(".empty");
+    if (empty) empty.remove();
+    var row = document.createElement("div");
+    row.className = "row";
+    var badge = '<span class="badge s' + res.status + '">' + res.status + "</span>";
+    var detail = "";
+    if (res.status === 201) {
+      detail = (res.replayed ? '<span class="replay">replayed, nothing applied again</span>' : "applied") +
+               ". Balance " + money(res.balance);
+    } else {
+      detail = "<b>" + res.code + "</b><span class=\"next\">Next step: " + res.next + "</span>";
+    }
+    row.innerHTML = '<div class="req">' + label + "</div>" + badge + detail;
+    logEl.insertBefore(row, logEl.firstChild);
+  }
+
+  function run(act) {
+    if (act === "same") {
+      addRow("POST payments  key=pay-1  amount=25.00", pay("pay-1", 2500));
+    } else if (act === "new") {
+      var k = newKey();
+      addRow("POST payments  key=" + k + "  amount=25.00", pay(k, 2500));
+    } else if (act === "diff") {
+      addRow("POST payments  key=pay-1  amount=99.00", pay("pay-1", 9900));
+    } else if (act === "over") {
+      var k2 = newKey();
+      addRow("POST payments  key=" + k2 + "  amount=500.00", pay(k2, 50000));
+    } else if (act === "full") {
+      var bal = balance();
+      var amt = state.keys["pay-final"] ? state.keys["pay-final"].amount : bal;
+      addRow("POST payments  key=pay-final  amount=" + money(amt), pay("pay-final", amt));
+    } else if (act === "burst") {
+      var applied = 0, replayed = 0, other = 0;
+      for (var i = 0; i < 20; i++) {
+        var r = pay("burst-1", 2500);
+        if (r.status === 201 && !r.replayed) applied++;
+        else if (r.status === 201) replayed++;
+        else other++;
+      }
+      var row = document.createElement("div");
+      row.className = "row";
+      var empty = logEl.querySelector(".empty");
+      if (empty) empty.remove();
+      row.innerHTML = '<div class="req">20 x POST payments  key=burst-1  amount=25.00</div>' +
+        '<span class="badge s201">201</span>' + applied + " applied, " + replayed + " replayed" +
+        (other ? ", " + other + " rejected" : "") + ". Balance " + money(balance());
+      logEl.insertBefore(row, logEl.firstChild);
+    }
+    render();
+  }
+
+  document.querySelectorAll("[data-act]").forEach(function (btn) {
+    btn.addEventListener("click", function () { run(btn.getAttribute("data-act")); });
+  });
+  document.getElementById("reset").addEventListener("click", function () {
+    fresh(); seq = 0;
+    logEl.innerHTML = '<div class="empty">Responses appear here, newest first.</div>';
+    render();
+  });
+  render();
+})();
+</script>
+</body>
+</html>
